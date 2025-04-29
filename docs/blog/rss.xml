@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?><?xml-stylesheet type="text/xsl" href="rss.xsl"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+    <channel>
+        <title>Aidan Carson Blog</title>
+        <link>https://aidancarson.com/blog</link>
+        <description>Aidan Carson Blog</description>
+        <lastBuildDate>Tue, 29 Apr 2025 00:00:00 GMT</lastBuildDate>
+        <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
+        <generator>https://github.com/jpmonette/feed</generator>
+        <language>en</language>
+        <item>
+            <title><![CDATA[Enabling pod to pod mTLS in Istio]]></title>
+            <link>https://aidancarson.com/blog/istio-pod-to-pod-mtls</link>
+            <guid>https://aidancarson.com/blog/istio-pod-to-pod-mtls</guid>
+            <pubDate>Tue, 29 Apr 2025 00:00:00 GMT</pubDate>
+            <description><![CDATA[Imagine a situation where you have multiple different clusters, each running]]></description>
+            <content:encoded><![CDATA[<p>Imagine a situation where you have multiple different clusters, each running
+an Istio service mesh and which are federated together to talk to each other.
+Now also imagine that these clusters are networked together such that each
+pod IP is uniquely addressable and able to be communicated with from any other
+cluster.</p>
+<p>I faced a situation like this, where I needed to group endpoints into logical
+hostnames that represented services backed by those endpoints. Because endpoints
+could live anywhere, in any cluster, I landed on using a ServiceEntry to register
+the hostname and WorkloadEntries to represent the endpoints service that hostname.
+The configuration looked something like this:</p>
+<p>ServiceEntry:</p>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar language-yaml codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>
+<p>WorkloadEntry:</p>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar language-yaml codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>]]></content:encoded>
+            <category>Istio</category>
+            <category>ServiceEntry</category>
+            <category>pod</category>
+            <category>mTLS</category>
+            <category>strict</category>
+            <category>authentication</category>
+        </item>
+    </channel>
+</rss>

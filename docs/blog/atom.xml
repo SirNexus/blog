@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?><?xml-stylesheet type="text/xsl" href="atom.xsl"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://aidancarson.com/blog</id>
+    <title>Aidan Carson Blog</title>
+    <updated>2025-04-29T00:00:00.000Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://aidancarson.com/blog"/>
+    <subtitle>Aidan Carson Blog</subtitle>
+    <icon>https://aidancarson.com/img/aidan-carson-toon.jpg</icon>
+    <entry>
+        <title type="html"><![CDATA[Enabling pod to pod mTLS in Istio]]></title>
+        <id>https://aidancarson.com/blog/istio-pod-to-pod-mtls</id>
+        <link href="https://aidancarson.com/blog/istio-pod-to-pod-mtls"/>
+        <updated>2025-04-29T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Imagine a situation where you have multiple different clusters, each running]]></summary>
+        <content type="html"><![CDATA[<p>Imagine a situation where you have multiple different clusters, each running
+an Istio service mesh and which are federated together to talk to each other.
+Now also imagine that these clusters are networked together such that each
+pod IP is uniquely addressable and able to be communicated with from any other
+cluster.</p>
+<p>I faced a situation like this, where I needed to group endpoints into logical
+hostnames that represented services backed by those endpoints. Because endpoints
+could live anywhere, in any cluster, I landed on using a ServiceEntry to register
+the hostname and WorkloadEntries to represent the endpoints service that hostname.
+The configuration looked something like this:</p>
+<p>ServiceEntry:</p>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar language-yaml codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>
+<p>WorkloadEntry:</p>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>
+<pre tabindex="0" class="codeBlockStandalone_MEMb thin-scrollbar language-yaml codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"></code></pre>]]></content>
+        <author>
+            <name>Aidan Carson</name>
+        </author>
+        <category label="Istio" term="Istio"/>
+        <category label="ServiceEntry" term="ServiceEntry"/>
+        <category label="pod" term="pod"/>
+        <category label="mTLS" term="mTLS"/>
+        <category label="strict" term="strict"/>
+        <category label="authentication" term="authentication"/>
+    </entry>
+</feed>
