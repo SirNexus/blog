@@ -2,3 +2,4 @@
 build:
 	@echo "Building the project..."
 	cd aidan-blog && yarn build --out-dir ../docs
+	cp .CNAME docs/CNAME
