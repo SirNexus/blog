@@ -1,1 +1,0 @@
-"use strict";(self.webpackChunkaidan_blog=self.webpackChunkaidan_blog||[]).push([[472],{5513:t=>{t.exports=JSON.parse('{"title":"Recent posts","items":[{"title":"Enabling pod to pod mTLS in Istio","permalink":"/blog/istio-pod-to-pod-mtls","unlisted":false,"date":"2025-04-29T00:00:00.000Z"}]}')}}]);
