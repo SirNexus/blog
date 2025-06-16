@@ -22,6 +22,8 @@ By design, kind runs Kubernetes clusters inside Docker containers. This means:
 * There’s no built-in way for a pod in one cluster to directly communicate with a pod in another cluster using its pod IP.
 * Bridging these isolated networks requires either complex overlay solutions or manual routing.
 
+<!-- truncate -->
+
 ## Options Considered
 1. Use Cilium Service Mesh
    * If you’re okay with the added configuration and overhead, Cilium Service Mesh is a great choice:
