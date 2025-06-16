@@ -1,6 +1,6 @@
 ---
 slug: kind-multi-cluster-flat-network
-title: Networking Multiple kind Kubernetes Clusters Together Using Native Routing
+title: Networking Multiple Kind Kubernetes Clusters Together Using Native Routing
 authors: aidancarson
 tags: [Kind, Kubernetes, Networking, Pod, Linux]
 # Display h2 to h5 headings
