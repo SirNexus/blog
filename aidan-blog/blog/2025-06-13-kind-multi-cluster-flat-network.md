@@ -1,6 +1,6 @@
 ---
 slug: kind-multi-cluster-flat-network
-title: Kind multi cluster flat network
+title: Networking Multiple kind Kubernetes Clusters Together Using Native Routing
 authors: aidancarson
 tags: [Kind, Kubernetes, Networking, Pod, Linux]
 # Display h2 to h5 headings
@@ -8,121 +8,90 @@ toc_min_heading_level: 2
 toc_max_heading_level: 5
 ---
 
-# Context
+Recently, I set out to create a multi-cluster kind environment where clusters could communicate over a flat network. 
+The goal was simple: pods in one cluster should be able to directly talk to pods in another cluster without requiring tunneling or proxies.
 
-I was trying to set up a multi-cluster kind environment, with a flat network
-for communication between clusters. This means that I wanted to be able to have
-the pods in one cluster communicate with the pods in another cluster.
-This seemed like a hard problem to solve, since the pod IPs aren't communicated
-outside the context of the docker container. This article will go over
-the different options I considered, as well as what ended up being a straightforward solution
-to the problem.
+At first glance, this seemed tricky — the pod IPs assigned inside kind clusters exist only within the containerized 
+network of each cluster, and Docker isolates these networks by default. However, I eventually found a straightforward 
+solution that uses native routing, and I wanted to share my journey and what worked.
 
-If you're okay with the configuration and overhead, I would use [Cilium Service Mesh](https://docs.cilium.io/en/stable/network/servicemesh/)
-to set up a flat network across clusters. This allows not only pod to pod communication,
-but also allows pods to address each other by service name by enabling
-[Global Service Affinity](https://docs.cilium.io/en/stable/network/clustermesh/affinity/#enabling-global-service-affinity).
+## The Challenge
+By design, kind runs Kubernetes clusters inside Docker containers. This means:
 
-<!-- truncate -->
+* Pod IPs are only visible inside the Docker network created for each kind cluster.
+* There’s no built-in way for a pod in one cluster to directly communicate with a pod in another cluster using its pod IP.
+* Bridging these isolated networks requires either complex overlay solutions or manual routing.
 
-# Native Routing
+## Options Considered
+1. Use Cilium Service Mesh
+   * If you’re okay with the added configuration and overhead, Cilium Service Mesh is a great choice:
+   * It can establish a flat network across multiple clusters.
+   * With [Global Service Affinity](https://docs.cilium.io/en/stable/network/clustermesh/affinity/#enabling-global-service-affinity),
+     services in different clusters can even resolve each other’s names and load balance between them.
 
-If you don't or can't use Cilium there is also a way to connect clusters together using native routing.
-It allows you to set up a flat network across clusters, but it does
-not allow you to use the kube-dns service to resolve pod IPs across clusters.
 
-## Setup
+2. Native Routing Using ip route (The solution that worked): manually add routes 
+   to each Docker container that runs a kind node.
+   * Each node knows how to route pod traffic destined for another cluster’s pod subnet.
+   * Traffic flows directly via the Docker bridge network, using the container IP of the appropriate node as the next hop.
 
-Here are the steps that you can set up flat networking with native routing using kind:
 
-1. First we need to create the kind clusters. The important part here is to ensure that the pod and service subnets
-   do not overlap with each other. Create two kind cluster configs:
+For my use case, I wanted a lighter-weight solution that didn’t require
+deploying cilium cluster mesh, so I opted for the native routing approach.
 
-   The first cluster:
-   ```bash
-   cat << EOF > cluster1.yaml 
-   kind: Cluster
-   apiVersion: kind.x-k8s.io/v1alpha4
-   nodes:
+## Example Configuration
+
+Here’s an example kind config I used to define pod and service subnets:
+
+```yaml
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
    - role: control-plane
    - role: worker
-   networking:
-      disableDefaultCNI: true
-      podSubnet: "10.0.0.0/16"
-      serviceSubnet: "10.1.0.0/16"
-   EOF
-   ```
-   
-   The second cluster:
-   ```bash
-   cat << EOF > cluster2.yaml
-   kind: Cluster
-   apiVersion: kind.x-k8s.io/v1alpha4
-   nodes:
-   - role: control-plane
-   - role: worker
-   networking:
-      disableDefaultCNI: true
-      podSubnet: "10.2.0.0/16"
-      serviceSubnet: "10.3.0.0/16"
-   EOF
-   ```
+     networking:
+     disableDefaultCNI: true
+     podSubnet: "10.0.0.0/16"
+     serviceSubnet: "10.1.0.0/16"
+```
+To make routing work, I added routes like:
 
-2. Create the clusters using the configs:
-   ```bash
-    kind create cluster --config cluster1.yaml --name cluster1
-    kind create cluster --config cluster2.yaml --name cluster2
-   ``` 
+```bash
+ip route add 10.0.0.0/16 via <docker-container-ip-of-cluster1-node>
+ip route add 10.2.0.0/16 via <docker-container-ip-of-cluster2-node>
+```
+Each via IP corresponds to a Docker container (the kind node) that knows how to reach its local pod subnet.
 
-3. Create curl and echo deployments to test connectivity in both clusters:
-   ```bash
-    kubectl --context kind-cluster1 create deployment curl --image=curlimages/curl
-    kubectl --context kind-cluster1 create deployment echo --image=hashicorp/http-echo -- /bin/http-echo -text "\"Hello from cluster1\""
-    
-    kubectl --context kind-cluster2 create deployment curl --image=curlimages/curl
-    kubectl --context kind-cluster2 create deployment echo --image=hashicorp/http-echo -- /bin/http-echo -text "\"Hello from cluster2\""
-   ```
+## Example Workflow
+1. Create two kind clusters with distinct pod subnets:
 
-## How to configure Native Routing
+Cluster A: 10.0.0.0/16
 
-The trick for configuring native routing is to ensure that the IP address range
-of the pods for the other cluster are reachable from the nodes of each cluster.
+Cluster B: 10.2.0.0/16
 
-1. To do this, we first get the IP address of the target cluster:
+2. Retrieve the Docker container IPs for the nodes in each cluster:
 
-   ```bash 
-   $ docker inspect cluster2-worker -f "{{.NetworkSettings.Networks.kind.IPAddress}}"
-   172.18.0.3
-   ```
+```bash
+docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <container-name>
+```
+3. On each kind node container, add routes for the other cluster’s pod subnet:
 
-2. Then in the cluster we want to enable connectivity in, we add a route to the pod network of the target cluster.
-   For example, in `cluster1`, we want to add a route `cluster2`'s pod network.
+```bash
+docker exec <cluster-a-node> ip route add 10.2.0.0/16 via <cluster-b-node-ip>
+docker exec <cluster-b-node> ip route add 10.0.0.0/16 via <cluster-a-node-ip>
+```
 
-   ```bash
-   # note 10.2.0.0/16 from cluster2.yaml's pod subnet
-   # We set the next hop to the IP address of the control plane node of cluster2
-   $ docker exec cluster1-worker ip route add 10.2.0.0/16 via 172.18.0.3
-   ```   
-   
-   And we can do the same for the service subnet:
+The Result: Pods in Cluster A can now talk to pods in Cluster B by pod IP, and vice versa!
 
-   ```bash
-   $ docker exec cluster1-worker ip route add 10.3.0.0/16 via 172.18.0.3
-   ```
+## Final Thoughts
+If you’re experimenting with multi-cluster setups in a local or CI environment, 
+this native routing method is lightweight and effective. That said, for production-like features (service discovery, identity-aware routing, encryption), service mesh solutions like Cilium offer more power and flexibility.
 
-3. Now if we get the ip address of the echo pod in cluster 2:
-   ```bash
-   $ kubectl get pod -o wide --context kind-cluster2
-   NAME                   READY   STATUS    RESTARTS   AGE     IP           NODE              NOMINATED NODE   READINESS GATES
-   echo-9b959696d-547qm   1/1     Running   0          4m48s   10.6.1.108   cluster2-worker   <none>           <none>
-   ```
-   
-   We can see that the pod IP is `10.6.1.108`
+## A note for Cilium and service networking
 
-4. And if we try to curl that pod IP from the curl pod in cluster 1:
-   ```bash
-   $ kubectl exec -it curl-6b7f4c5d6c-8j5qk --context kind-cluster1 -- curl
-   ```
+If you're using Cilium for your CNI, you'll want to use the `bpf.lbExternalClusterIP`
+option in helm. This will expose the cluster IPs to the host network on the nodes,
+allowing you to also address the service IPs from your other clusters.
 
-[//]: # (TODO:)
-
+Happy clustering! If you have any questions or suggestions, feel free to reach out.
