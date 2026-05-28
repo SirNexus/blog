@@ -1,1 +1,0 @@
-"use strict";(self.webpackChunkaidan_blog=self.webpackChunkaidan_blog||[]).push([[696],{7617:a=>{a.exports=JSON.parse('{"tag":{"label":"Pod","permalink":"/blog/tags/pod","allTagsPath":"/blog/tags","count":2,"unlisted":false},"listMetadata":{"permalink":"/blog/tags/pod","page":1,"postsPerPage":10,"totalPages":1,"totalCount":2,"blogDescription":"Blog","blogTitle":"Blog"}}')}}]);
