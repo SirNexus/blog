@@ -10,55 +10,29 @@ toc_max_heading_level: 5
 
 # Enabling pod to pod mTLS in Istio
 
-Imagine a situation where you have multiple different clusters, each running
-an Istio service mesh and which are federated together to talk to each other.
-Now also imagine that these clusters are networked together such that each
-pod IP is uniquely addressable and able to be communicated with from any other
-cluster.
+Istio handles mTLS beautifully when you're routing traffic through Kubernetes services. You flip on strict mode, everything keeps working, and you go home happy. But the moment you need to address pods *directly by IP* -- say, for cross-cluster communication over a flat network -- things get weird. Strict mTLS breaks in ways that are surprisingly hard to debug.
 
-## Context
+This post walks through that exact scenario: how to get Istio's mTLS working when your traffic targets pod IPs instead of service names.
 
-I faced a situation like this, where I needed to group endpoints into logical
-hostnames that represented services backed by those endpoints. Because endpoints
-could live anywhere, in any cluster, I landed on using a ServiceEntry to register
-the hostname and WorkloadEntries to represent the endpoints service that hostname.
+## When would you need this?
 
-But a problem came on enabling PeerAuthentication:
+If you're addressing pods by IP rather than by service name, this post is for you. Common scenarios:
 
-```yaml
-apiVersion: security.istio.io/v1
-kind: PeerAuthentication
-metadata:
-  name: default
-  namespace: prod-istio-system # The namespace of our istio installation
-spec:
-  mtls:
-    mode: STRICT
-```
+- **Multi-cluster with a flat network** -- pods are routable by IP across clusters, but you don't have shared DNS or a common service registry. You can't just `curl my-service.namespace` because that service doesn't exist in the calling cluster.
+- **ServiceEntry + WorkloadEntry patterns** -- you're grouping remote pod IPs under a logical hostname using Istio primitives, essentially building your own cross-cluster service discovery.
+- **Migrating workloads off-cluster** -- VMs or legacy pods that need to participate in the mesh but aren't behind a Kubernetes Service.
 
-Curl stopped working!
+In all these cases, Istio doesn't have a native Service object to associate with the destination pod. And that's where strict mTLS falls apart, because Istio relies on that association to know the destination's identity.
 
-```bash
-$ curl global-echo
-upstream connect error or disconnect/reset before headers. reset reason: connection termination
-```
-
-Through some debugging, I was able to get it to:
-```bash
-$ curl global-echo
-upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, 
-transport failure reason: TLS_error:|268435581:SSL routines:OPENSSL_internal:CERTIFICATE_VERIFY_FAILED:TLS_error_end
-```
-
-But to find the true root cause and solution took some digging.
-
-Let's get into it
+The short version: your WorkloadEntry needs a `serviceAccount` field, and your ServiceEntry needs the correct `subjectAltNames`. Keep reading for the full debugging story.
 
 <!-- truncate -->
 
-## Setup
+## The setup
 
-The configuration looked something like this:
+Here's the situation. I have two clusters, both running Istio, networked together so that pod IPs are directly routable between them. There's no shared service registry -- a pod in cluster1 can't just `curl echo.echo` and hit a pod in cluster2. So I need a way to address these remote pods, ideally under a single logical hostname.
+
+The Istio primitives for this are **ServiceEntry** (to define the hostname) and **WorkloadEntry** (to register individual pod IPs as endpoints behind it). It's essentially building your own service abstraction on top of raw pod IPs. Here's what my configuration looked like:
 
 ServiceEntry:
 ```yaml
@@ -146,9 +120,7 @@ metadata:
 
 ```
 
-These resources specify a host `global-echo`, and two backend services each of which
-live in their own clusters. Behind the scenes, I have these services running simple
-echo servers. If you'd like that yaml, here it is:
+So we have a hostname `global-echo` backed by two pods, each living in a different cluster. Behind the scenes, both pods are running simple echo servers. If you want to reproduce this, here's the deployment I used:
 
 ```yaml
 apiVersion: apps/v1
@@ -181,7 +153,7 @@ spec:
               memory: "100Mi"
 ```
 
-And it works! I can curl both pods in my mesh:
+And it works great -- traffic load-balances across both clusters:
 
 ```
 for i in {1..10}; do curl global-echo; done
@@ -197,12 +169,11 @@ cluster1
 cluster2
 ```
 
-## The Problem
+Everything's looking good so far. But we haven't verified security yet.
 
-So networking is working. Istio is generating the correct Envoy config such that
-our global hostname routes to our backing services on each cluster. But what about
-security? Just to make sure that Istio is actually performing mTLS between pods,
-let's turn on strict mTLS.
+## The problem: enabling strict mTLS breaks everything
+
+Networking is working, Istio is generating the right Envoy config, and our global hostname happily routes to both clusters. But is traffic actually encrypted? Let's enforce it by turning on strict mTLS:
 
 ``` bash
 $ kubectl apply -f - <<EOF
@@ -217,7 +188,7 @@ spec:
 EOF
 ```
 
-Let's check that our communication still works:
+And now let's see if things still work:
 
 ```bash
 $ for i in {1..10}; do curl global-echo; done
@@ -233,37 +204,31 @@ upstream connect error or disconnect/reset before headers. reset reason: connect
 upstream connect error or disconnect/reset before headers. reset reason: connection termination
 ```
 
-Our connection broke! What gives! I thought Istio was routing our services? Spoiler:
-our connection broke because istio was using PERMISSIVE mode and sending our traffic
-over plaintext. Now that we are enforcing STRICT mTLS mode, Istio is breaking.
-This means that we weren't secure before, sending traffic over plaintext. This is
-super interesting. Istio should be handling the upgrading of our communication to
-mTLS by default. So what's happening? Let's do some testing.
+Completely broken. And here's the kicker -- this tells us something important about what was happening *before*. Our traffic was never actually using mTLS. Istio was in PERMISSIVE mode, so it was happily sending everything as plaintext. We thought we had encryption, but we didn't. That's precisely why strict mode is worth enforcing -- it surfaces these misconfigurations instead of silently downgrading your security.
 
-## Finding the Solution
+So what's going wrong? When you route through a normal Kubernetes Service, Istio handles mTLS automatically. But we're not doing that -- we're routing to pod IPs. Let's dig in.
 
-So let's look at the local endpoint. Curling from cluster1, we have a local echo
-pod IP of `10.4.2.45`. Let's curl that:
+## Debugging: it's a pod-IP problem, not an mTLS problem
+
+First, let's confirm the issue is specific to pod-IP routing. The local echo pod in cluster1 has IP `10.4.2.45`:
 
 ```bash
 $ curl 10.4.2.45
 upstream connect error or disconnect/reset before headers. reset reason: connection termination
 ```
 
-Hm, so that's broken. That makes sense, since the service entry is just resolving
-DNS requests to the WorkloadEntry specifying `curl 10.4.2.45`.
+Broken -- but that's the same pod IP our ServiceEntry resolves to, so no surprise there.
 
-But now let's try the echo service itself:
+Now let's try the same pod through its regular Kubernetes Service:
 
 ```bash
 $ curl echo.echo
 cluster1
 ```
 
-That works! How strange! So istio is *capable* of routing our traffic over mTLS,
-it just isn't when connecting to the **pod IP** rather than service.
+That works. Same pod, same sidecar, same strict mTLS policy -- but it works because Istio *knows* this pod's identity through the Service object.
 
-Okay, so what about service IP? Let's get the ip of the associated echo service:
+What about the service's ClusterIP directly?
 
 ```bash
 $ kubectl get svc -n echo
@@ -271,17 +236,16 @@ NAME            TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)   AGE
 echo            ClusterIP   10.5.113.88   <none>        80/TCP    48m
 ```
 
-And now let's curl that:
-
 ```bash
 $ curl 10.5.113.88
 cluster1
 ```
 
-That also works! So from this we can conclude that Istio is routing things correctly
-when using the service name or service IP, but not when using the pod IP. Upon further
-reflection on the Istio documentation on [WorkloadEntry](https://istio.io/latest/docs/reference/config/networking/workload-entry/),
-these lines stand out:
+Also works. Istio intercepts the ClusterIP traffic and still associates it with the known service.
+
+So the pattern is clear: **Istio handles mTLS correctly when it can associate traffic with a Kubernetes Service** (by DNS name or ClusterIP). But when traffic goes to a bare pod IP through a ServiceEntry + WorkloadEntry, Istio doesn't have enough information to establish identity -- and mTLS fails. This is the fundamental challenge of the pod-IP approach.
+
+This sent me back to the [Istio WorkloadEntry docs](https://istio.io/latest/docs/reference/config/networking/workload-entry/), where this comment caught my eye:
 
 ```
 ...
@@ -292,8 +256,7 @@ these lines stand out:
   serviceAccount: details-legacy
 ```
 
-This means that when working with a WorkloadEntry, Istio looks for a serviceAccount
-associated with the pod to communicate over mTLS. So let's add that:
+There it is. Istio needs a `serviceAccount` on the WorkloadEntry to know that the destination has a sidecar and to initiate mTLS. Without it, Istio doesn't know what identity to expect from the remote pod. Let's add it:
 
 ```yaml
 apiVersion: networking.istio.io/v1
@@ -323,19 +286,19 @@ spec:
   serviceAccount: client # <-----   Added this
 ```
 
-Now, let's try our global-echo curl:
+Now let's try again:
 
 ```bash
 $ curl global-echo
 upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS_error:|268435581:SSL routines:OPENSSL_internal:CERTIFICATE_VERIFY_FAILED:TLS_error_end
 ```
 
-Weird. Now we're getting a certificate issue. I suppose this means Istio is *trying*
-to communicate with the pod over mTLS, but there's clearly a certificate issue going wrong.
-It's time to look at the Istio logs.
+Progress! The error changed. Istio is now *attempting* mTLS (good!) but the certificate verification is failing (not good). Time to look at the Envoy logs.
 
-On a successful request (`curl 10.5.113.88`), we see Istio logs coming from the client
-sidecar:
+## Diving into the Envoy logs
+
+On a successful request (`curl 10.5.113.88` -- the ClusterIP that works), the client sidecar logs show:
+
 ```
 2025-04-29T17:44:56.975202Z	debug	envoy filter external/envoy/source/extensions/filters/listener/original_dst/original_dst.cc:69	original_dst: set destination to 10.5.113.88:80	thread=28
 2025-04-29T17:44:56.975404Z	debug	envoy filter external/envoy/source/extensions/filters/listener/http_inspector/http_inspector.cc:139	http inspector: set application protocol to http/1.1	thread=28
@@ -390,11 +353,9 @@ sidecar:
 2025-04-29T17:44:56.977944Z	debug	envoy conn_handler external/envoy/source/common/listener_manager/active_stream_listener_base.cc:136	[Tags: "ConnectionId":"192"] adding to cleanup list	thread=28
 ```
 
-Note particularly the line `cluster 'outbound|80||echo.echo.svc.cluster.local' match for URL '/'	thread=28`.
-This gives us some important information. Even on an IP route to the service,
-Istio is matching the request to the outbound service it has configured.
+The key line: `cluster 'outbound|80||echo.echo.svc.cluster.local' match for URL '/'`. Even on an IP-based request, Istio matches it to the known outbound service and handles mTLS correctly.
 
-Let's compare that to the log when we send a request to the `global-echo` service:
+Now compare that to what happens when we hit `global-echo`:
 
 ```
 2025-04-29T18:08:46.944432Z	debug	envoy filter external/envoy/source/extensions/filters/listener/original_dst/original_dst.cc:69	original_dst: set destination to 240.240.0.1:80	thread=29
@@ -487,26 +448,24 @@ Let's compare that to the log when we send a request to the `global-echo` servic
 2025-04-29T18:08:47.017318Z	debug	envoy conn_handler external/envoy/source/common/listener_manager/active_stream_listener_base.cc:136	[Tags: "ConnectionId":"446"] adding to cleanup list	thread=29
 ```
 
-As you can see, the request is being handled by the `outbound|80||global-echo` cluster,
-and yet the upstream server is still responding with a 503. There is a pertinent
-part here that hints at what might be going wrong:
+The request routes through `outbound|80||global-echo` -- that's our ServiceEntry cluster. But look at this line:
 
 ```
-2025-04-29T18:08:46.947216Z	debug	envoy connection external/envoy/source/common/tls/cert_validator/default_validator.cc:246	verify cert failed: SAN matcher	thread=29
+verify cert failed: SAN matcher
 ```
 
-our SAN isn't getting matched. For anyone not super familiar, a
-SAN stands for Subject Alternative Name. It is an extension in X.509 certificates (used in TLS/SSL) that allows you to 
-specify additional identities (such as DNS names, IP addresses, or URIs) that the certificate should be valid for, 
-beyond the primary Common Name (CN). Istio uses this to verify the spiffeID
-associated with the serviceAccount used in the mTLS handshake.
+That's the smoking gun. The SAN (Subject Alternative Name) isn't matching. Quick refresher: a SAN is an extension in X.509 certificates that specifies which identities a certificate is valid for. In Istio's world, this means the SPIFFE ID tied to the workload's service account. Istio uses this during the mTLS handshake to verify "am I actually talking to who I think I'm talking to?"
 
-Let's debug the cluster configuration next in envoy and see if there's a difference.
+## The root cause: mismatched SANs in the Envoy cluster config
 
-(Commands gotten with `istioctl pc cluster -n curl curl-f4cd469d6-wnsrx --fqdn echo.echo.svc.cluster.local -o j
-son`)
+Let's compare the Envoy cluster configurations between the working and broken cases. You can pull these with:
 
-Diff between cluster configs of not working (`-`) and not working (`+`)
+```
+istioctl pc cluster -n curl curl-f4cd469d6-wnsrx --fqdn echo.echo.svc.cluster.local -o json
+```
+
+Here's the critical diff:
+
 ```diff
                   "defaultValidationContext": {
                     "matchSubjectAltNames": [
@@ -524,13 +483,13 @@ Diff between cluster configs of not working (`-`) and not working (`+`)
                     ]
                   },
 ```
-(Note the output has been cleaned to show the pertinent, non-trivial parts)
 
-This is the key. Inside of Istio's tls configuration, the configured SAN in
-the working configuration is associated with the *destination* service account,
-while in the non-working configuration, it is associated with the *source* service account.
+There it is. In the working configuration (the regular Kubernetes service), Istio expects the *destination's* service account identity (`ns/echo/sa/default`). In our broken ServiceEntry configuration, it's expecting the *source's* identity (`ns/curl/sa/curl`). That's backwards -- the SAN should always match the destination.
 
-According to the Istio documentation, we can edit the SAN inside of our ServiceEntry:
+## The fix
+
+The ServiceEntry has a `subjectAltNames` field specifically for this. We need to tell Istio what SPIFFE identity to expect when connecting to backends of this service:
+
 ```yaml
 apiVersion: networking.istio.io/v1
 kind: ServiceEntry
@@ -548,29 +507,31 @@ spec:
       targetPort: 8080
   resolution: STATIC
   subjectAltNames:
-    - spiffe://cluster.local/ns/echo/sa/default # <----- Added this
+    - spiffe://cluster.local/ns/echo/sa/default # <----- This is the key
   workloadSelector:
     labels:
       global-service: global-echo
 ```
 
-And once that's applied, we can test our custom host:
+Apply that, and:
 
 ```bash
 $ curl global-echo
 cluster1
 ```
 
-It works! So now we have a custom host routing directly between pod IPs.
+It works. We now have a custom hostname routing directly between pod IPs across clusters, with full mTLS encryption verified by SPIFFE identity.
 
-## Summary
+## TL;DR
 
-In this post, we learned how to set up a custom host in Istio that routes between
-two different clusters. We learned how to set up a ServiceEntry and WorkloadEntry
-to route between the two clusters, and how to set up a custom SAN in the ServiceEntry
-to allow for mTLS communication between the two clusters. We also learned how to
-debug the Istio configuration to find out what was going wrong with our mTLS
-configuration, and how to fix it by adding the correct SAN to the ServiceEntry.
+Istio's mTLS "just works" when you route through Kubernetes Services -- but when you need to reach pods by IP (common in multi-cluster flat networks), you're on your own to provide the identity information that Istio normally gets for free from the Service object.
+
+If you're using ServiceEntry + WorkloadEntry to route traffic to pod IPs and strict mTLS is breaking things, you need two things:
+
+1. **Add `serviceAccount` to your WorkloadEntries** -- this tells Istio the destination has a sidecar and should use mTLS (without it, Istio sends plaintext)
+2. **Add the correct `subjectAltNames` to your ServiceEntry** -- this must be the SPIFFE ID of the *destination* workload's service account, not the source (without it, certificate verification fails)
+
+These two fields are what bridge the gap between "addressing a pod by IP" and "Istio knowing who that pod is."
 
 ### Related Issues
 
