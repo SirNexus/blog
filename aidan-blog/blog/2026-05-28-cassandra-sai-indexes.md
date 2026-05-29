@@ -9,9 +9,9 @@ toc_max_heading_level: 5
 
 # Cassandra SAI Indexes: When They Work and When They Don't
 
-Storage-Attached Indexing (SAI) is Cassandra's modern approach to secondary indexing. It promises efficient queries on non-partition-key columns without the scaling problems of legacy secondary indexes. But SAI has boundaries — and when your query crosses them, Cassandra silently falls back to a full table scan regardless of whether the index exists.
+Storage-Attached Indexing (SAI) is Cassandra's modern approach to secondary indexing. It promises efficient queries on non-partition-key columns without the scaling problems of legacy secondary indexes. But SAI has boundaries — and when your query crosses them, Cassandra can end up performing slower than if the index didn't exist at all.
 
-This post walks through how SAI works under the hood, when it can be used, and when Cassandra ignores it entirely — even when your WHERE clause references an SAI-indexed column.
+This post walks through how SAI works under the hood, when it can be used, and when Cassandra bypasses it entirely — even when your WHERE clause references a SAI-indexed column.
 
 <!-- truncate -->
 
@@ -70,7 +70,7 @@ For numeric columns, SAI uses tree structures (kd-trees or tries) that support r
 
 ### Query Execution With SAI
 
-When a query uses an SAI-indexed column:
+When a query uses a SAI-indexed column:
 
 1. The coordinator sends the query to all nodes that might have relevant data
 2. Each node checks its local SAI index segments (one per SSTable)
@@ -151,7 +151,7 @@ SAI can intersect results from multiple index segments within each SSTable, narr
 
 ## When SAI Indexes Don't Work (Even When They Exist)
 
-This is where things get subtle. You can have a perfectly valid SAI index on a column, reference that column in your WHERE clause, and Cassandra will still ignore the index and perform a brute-force scan.
+This is where things get subtle. You can have a perfectly valid SAI index on a column, reference that column in your WHERE clause, and Cassandra will still bypass the index and perform a brute-force scan — or use the index in a way that makes performance worse.
 
 ### Case 1: DISTINCT Queries
 
@@ -162,7 +162,7 @@ ALLOW FILTERING
 
 `DISTINCT` tells Cassandra to return one result per partition key. Cassandra implements this as a partition-skipping scan — it walks partition boundaries, reads the first row (or static columns), and jumps to the next partition.
 
-SAI operates at the row level. It answers: "which rows in this SSTable match the predicate?" But DISTINCT operates at the partition level: "give me one result per partition." These are different execution strategies in Cassandra's query engine, and the planner does not compose them.
+SAI operates at the row level. It answers: "which rows in this SSTable match the predicate?" But DISTINCT operates at the partition level: "give me one result per partition." These are different execution strategies in Cassandra's query execution engine, and it does not compose them.
 
 What actually happens:
 1. Cassandra walks through every partition (the DISTINCT scan)
@@ -172,44 +172,20 @@ What actually happens:
 
 The SAI index is never consulted. The predicate is pure post-filtering. Hence `ALLOW FILTERING` is required.
 
-### Case 2: Predicates on Static Columns
-
-```sql
-CREATE TABLE my_table (
-    pk text,
-    ck text,
-    static_col bigint STATIC,
-    PRIMARY KEY (pk, ck)
-);
-CREATE INDEX ON my_table (static_col) USING 'sai';
-
-SELECT * FROM my_table WHERE static_col > 1000 ALLOW FILTERING;
-```
-
-Static columns exist once per partition, but SAI indexes point to rows within SSTables. There's an impedance mismatch: the index maps values to row-level positions, but a static column doesn't correspond to any specific clustering row — it belongs to the partition as a whole.
-
-When you filter on a static column, Cassandra reverts to scanning partitions and checking the static value after reading, rather than using the index to skip non-matching partitions.
-
-### Case 3: Low Selectivity (Predicate Matches Most Data)
+### Case 2: Low Selectivity (Predicate Matches Most Data)
 
 ```sql
 -- If 95% of nodes have cert_not_after in the future:
 SELECT * FROM attested_node_entries WHERE cert_not_after > ?
 ```
 
-When a predicate matches the vast majority of rows, Cassandra's query planner may skip the index entirely. Using an index involves: traversing the index structure, building a list of matching row positions, then performing random I/O to read those rows from the SSTable data file.
+When a predicate matches the vast majority of rows, SAI will still use the index — Cassandra does not have a cost-based optimizer that decides to skip it. But the performance can be worse than a sequential scan would have been.
 
-If 95% of rows match, the random I/O from index lookups is more expensive than a sequential scan through the data file. The planner recognizes this and falls back to a full scan with post-filtering. The cutoff is heuristic-based and depends on the data distribution.
+Using an index involves: traversing the index structure, building a list of matching row positions, then performing random I/O to read those rows from the SSTable data file. If 95% of rows match, you're paying the overhead of index traversal plus random I/O to read nearly every row anyway. A sequential scan through the data file would have been cheaper, but Cassandra doesn't make that trade-off for you.
 
-### Case 4: Queries Requiring Global Ordering
+This isn't a case where the index is ignored — it's a case where having the index actively hurts read performance.
 
-```sql
-SELECT * FROM events WHERE status = 'pending' ORDER BY created_at DESC
-```
-
-SAI does not maintain global sort order. It finds matching rows within each SSTable in token order (partition hash order), not in the order of any particular column. If your query requires results sorted by a non-clustering column, the index cannot provide sorted output — results must be collected and sorted after the fact.
-
-### Case 5: The Combination Problem (Real-World Example)
+### Real-World Example
 
 Here's the query that prompted this post — from a SPIRE server's Cassandra datastore plugin:
 
@@ -233,20 +209,35 @@ CREATE TABLE attested_node_entries (
 CREATE INDEX cert_not_after_idx ON attested_node_entries (cert_not_after) USING 'sai';
 ```
 
-This query hits three problems simultaneously:
+This query hits multiple problems simultaneously:
 1. `DISTINCT` — uses the partition-skipping execution path, incompatible with index lookups
-2. `cert_not_after` is `STATIC` — impedance mismatch with row-level index
-3. Most nodes are non-expired — low selectivity, index wouldn't help much even if it could be used
+2. Most nodes are non-expired — low selectivity, index wouldn't help much even if it could be used
 
 The result: the SAI index on `cert_not_after` is completely dormant for this query. Cassandra walks every partition in the table, reads the static `cert_not_after` value, checks `> ?`, and either returns or discards it. At scale (large number of attested nodes), this averages 1.91 seconds and frequently times out at 5 seconds.
+
+The fix was to remove the `WHERE` clause and filter in the application instead:
+
+```sql
+SELECT DISTINCT spiffe_id, selector_type_value_full, cert_not_after
+FROM attested_node_entries
+```
+
+By dropping `ALLOW FILTERING` and the predicate, Cassandra no longer applies a per-partition filter during the scan. The application receives all partitions and filters `cert_not_after > ?` in memory. The result: 203ms for the first page, 34ms for subsequent pages, ~271ms total — down from 1.91 seconds average with frequent 5-second timeouts.
 
 ## Understanding ALLOW FILTERING as a Signal
 
 `ALLOW FILTERING` is not just a syntax requirement — it's a diagnostic signal. When Cassandra requires it, it's telling you:
 
-"I cannot serve this query efficiently. I will read data first and apply the predicate after. This will be a full scan with post-read filtering."
+"At least one predicate in this query cannot be satisfied by an index and will require post-read filtering."
 
-If your query requires `ALLOW FILTERING`, the SAI index is not being used for that predicate (or Cassandra has determined the index won't help). The presence of both an SAI index on a column and `ALLOW FILTERING` in a query referencing that column is a red flag — it means you're paying for index maintenance (write amplification during flushes and compaction) without gaining any read benefit.
+This does not mean all indexes are bypassed. In a query with multiple predicates, SAI can still narrow results using indexed columns before post-filtering on the unindexed ones. For example:
+
+```sql
+-- SAI index exists on col1, but NOT on col2:
+SELECT * FROM my_table WHERE col1 = 'hello' AND col2 < 1000 ALLOW FILTERING;
+```
+
+Here, SAI uses the index on `col1` to find matching rows, then post-filters on `col2`. The `ALLOW FILTERING` is required because of `col2`, not because the index on `col1` is being ignored.
 
 ## Alternatives When SAI Can't Help
 
@@ -287,10 +278,11 @@ SAI is effective when:
 - The predicate is selective (filters out a meaningful portion of data)
 - The execution path is a standard read (not DISTINCT or aggregation)
 
-SAI is ignored when:
+SAI is structurally bypassed when:
 - `DISTINCT` forces a partition-skipping execution path
-- The indexed column is `STATIC` (partition-level, not row-level)
-- The predicate matches most rows (sequential scan beats random I/O)
-- The query combines multiple factors that individually push toward filtering
+- The query combines factors that force an incompatible execution path
 
-The takeaway: an SAI index existing on a column does not guarantee it will be used. The query's full execution context — DISTINCT, static columns, selectivity, ordering requirements — determines whether Cassandra can leverage the index or falls back to brute-force filtering. When `ALLOW FILTERING` appears in your query, that's Cassandra telling you the index isn't helping.
+SAI is used but hurts performance when:
+- The predicate matches most rows (random I/O through the index is worse than a sequential scan would have been)
+
+The takeaway: Cassandra does not have a cost-based optimizer. It won't intelligently decide to skip a SAI index when it would be cheaper to scan. Instead, it either *cannot* use the index (the execution path is structurally incompatible) or it *will* use it regardless of whether that helps.
