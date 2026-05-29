@@ -160,17 +160,17 @@ SELECT DISTINCT partition_key, static_col FROM my_table WHERE indexed_col > ?
 ALLOW FILTERING
 ```
 
-`DISTINCT` tells Cassandra to return one result per partition key. Cassandra implements this as a partition-skipping scan — it walks partition boundaries, reads the first row (or static columns), and jumps to the next partition.
+`DISTINCT` tells Cassandra to return one result per partition key. Without a WHERE clause, Cassandra implements this as a partition-skipping scan — it walks partition boundaries efficiently, reading one result per partition.
 
-SAI operates at the row level. It answers: "which rows in this SSTable match the predicate?" But DISTINCT operates at the partition level: "give me one result per partition." These are different execution strategies in Cassandra's query execution engine, and it does not compose them.
+But when you add a WHERE clause on a SAI-indexed column, the SAI index **is still consulted**. Cassandra uses the index scan path: it fans out to all token ranges and performs per-range index lookups. The DISTINCT deduplication is then applied on top of the index scan results.
 
-What actually happens:
-1. Cassandra walks through every partition (the DISTINCT scan)
-2. At each partition, it reads the relevant column from disk
-3. It applies the WHERE predicate as a post-read filter
-4. Rows that don't match are discarded after being read
+This is the worst of both worlds:
+1. SAI forces a parallel fan-out to every token range (expensive coordination overhead)
+2. Per range, the replica performs index lookups: opening index segments, traversing trees, reading posting lists
+3. DISTINCT then deduplicates the results at the partition level
+4. You pay the full cost of the index scan without any selectivity benefit — DISTINCT needs partition-level results anyway
 
-The SAI index is never consulted. The predicate is pure post-filtering. Hence `ALLOW FILTERING` is required.
+The SAI index is engaged but counterproductive. The index machinery adds overhead per range without reducing the amount of data that needs to be examined. `ALLOW FILTERING` is required because Cassandra recognizes this combination cannot be served efficiently.
 
 ### Case 2: Low Selectivity (Predicate Matches Most Data)
 
@@ -210,10 +210,10 @@ CREATE INDEX cert_not_after_idx ON attested_node_entries (cert_not_after) USING 
 ```
 
 This query hits multiple problems simultaneously:
-1. `DISTINCT` — uses the partition-skipping execution path, incompatible with index lookups
-2. Most nodes are non-expired — low selectivity, index wouldn't help much even if it could be used
+1. `DISTINCT` — the index scan path is engaged but counterproductive, adding coordination overhead without reducing work
+2. Most nodes are non-expired — low selectivity, index doesn't narrow results even where it is consulted
 
-The result: the SAI index on `cert_not_after` is completely dormant for this query. Cassandra walks every partition in the table, reads the static `cert_not_after` value, checks `> ?`, and either returns or discards it. At scale (large number of attested nodes), this averages 1.91 seconds and frequently times out at 5 seconds.
+The result: the SAI index on `cert_not_after` is actively harmful for this query. Cassandra fans out to all 145 token ranges, performs per-range index lookups, then deduplicates at the partition level for DISTINCT. The index adds per-range overhead (index segment traversal, posting list reads) without filtering out any meaningful amount of data. At scale (large number of attested nodes), this averages 1.91 seconds and frequently times out at 5 seconds.
 
 The fix was to remove the `WHERE` clause and filter in the application instead:
 
@@ -222,7 +222,7 @@ SELECT DISTINCT spiffe_id, selector_type_value_full, cert_not_after
 FROM attested_node_entries
 ```
 
-By dropping `ALLOW FILTERING` and the predicate, Cassandra no longer applies a per-partition filter during the scan. The application receives all partitions and filters `cert_not_after > ?` in memory. The result: 203ms for the first page, 34ms for subsequent pages, ~271ms total — down from 1.91 seconds average with frequent 5-second timeouts.
+By dropping the WHERE clause and `ALLOW FILTERING`, Cassandra no longer engages the SAI index. The query becomes a pure DISTINCT partition-skipping scan — walking partition boundaries efficiently without per-range index lookups. The application receives all partitions and filters `cert_not_after > ?` in memory. The result: 203ms for the first page, 34ms for subsequent pages, ~271ms total — down from 1.91 seconds average with frequent 5-second timeouts.
 
 ## Understanding ALLOW FILTERING as a Signal
 
@@ -278,11 +278,8 @@ SAI is effective when:
 - The predicate is selective (filters out a meaningful portion of data)
 - The execution path is a standard read (not DISTINCT or aggregation)
 
-SAI is structurally bypassed when:
-- `DISTINCT` forces a partition-skipping execution path
-- The query combines factors that force an incompatible execution path
-
-SAI is used but hurts performance when:
+SAI is used but counterproductive when:
+- `DISTINCT` forces partition-level deduplication on top of the index scan, adding coordination overhead without reducing work
 - The predicate matches most rows (random I/O through the index is worse than a sequential scan would have been)
 
-The takeaway: Cassandra does not have a cost-based optimizer. It won't intelligently decide to skip a SAI index when it would be cheaper to scan. Instead, it either *cannot* use the index (the execution path is structurally incompatible) or it *will* use it regardless of whether that helps.
+The takeaway: Cassandra does not have a cost-based optimizer. It won't intelligently decide to skip a SAI index when it would be cheaper to scan. If a WHERE clause references a SAI-indexed column, Cassandra will use the index — regardless of whether that helps or hurts performance.
